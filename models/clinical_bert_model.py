@@ -3,94 +3,144 @@ ClinicalBERT model wrapper for clinical entity extraction.
 
 Model: medicalai/ClinicalBERT
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ARCHITECTURE NOTE (per official model documentation)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+─────────────────────────────────────────────────────
 medicalai/ClinicalBERT is a Masked Language Model (fill-mask) trained
-on MIMIC-III clinical notes.  Its official usage is:
+on MIMIC-III clinical notes.  Official usage:
 
     from transformers import AutoTokenizer, AutoModel
     tokenizer = AutoTokenizer.from_pretrained("medicalai/ClinicalBERT")
     model     = AutoModel.from_pretrained("medicalai/ClinicalBERT")
 
-It does NOT have a trained NER/token-classification head.  Loading it
-via pipeline("ner", ...) forces a randomly-initialised classifier head
-(LABEL_0 / LABEL_1) whose predictions are meaningless.
+It has NO trained NER/token-classification head.  Loading it as a NER
+pipeline produces a randomly-initialised head (LABEL_0/LABEL_1) whose
+predictions are meaningless.
 
-Correct pipeline implemented here
-──────────────────────────────────
-1. Load the ClinicalBERT tokenizer (AutoTokenizer).  This tokenizer is
-   trained on clinical text, so it correctly handles medical vocabulary,
-   abbreviations (e.g. "ECG", "HbA1c"), and drug names.
+Pipeline used here
+──────────────────
+1.  Load AutoTokenizer + AutoModel (per model card).
+2.  Tokenize → decode with the ClinicalBERT tokenizer so that clinical
+    abbreviations and compound terms are handled correctly.
+3.  Apply keyword-based NER on the reconstructed text.
+4.  Return entity dicts compatible with entity_extractor downstream.
 
-2. Load the ClinicalBERT encoder (AutoModel) — used to produce
-   contextual embeddings of each clinical input (future-proof for
-   embedding-based downstream tasks).
-
-3. Use the ClinicalBERT tokenizer to tokenize and reconstruct the
-   surface form of the input, then apply keyword-based NER on the
-   reconstructed text.  The tokenizer's clinical vocabulary ensures
-   medical terms are not mis-split, improving keyword matching accuracy.
-
-This design keeps ClinicalBERT actively involved in the pipeline while
-guaranteeing reliable entity extraction from clinical text.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Exported constants (used by entity_fusion for post-processing)
+──────────────────────────────────────────────────────────────
+ABBREVIATION_MAP   str → canonical form  ("ecg" → "ECG")
+SUBSUMPTION_MAP    broad term → set of specific phrases that subsume it
+                   e.g. "pain" → {"chest pain", "abdominal pain", ...}
+                   If any specific phrase is present, the broad term is dropped.
 """
 
 import logging
 
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded model components
+# ── lazy-loaded model components ────────────────────────────────────────────
 _tokenizer = None
 _model = None
-_model_loaded: bool = False  # True once load_clinical_bert() has been called
+_model_loaded: bool = False
 
 
-# ── keyword dictionaries ────────────────────────────────────────────────────
+# ── abbreviation normalisation ───────────────────────────────────────────────
+# Maps lowercase surface form → preferred display string.
+ABBREVIATION_MAP: dict[str, str] = {
+    "ecg":   "ECG",
+    "ekg":   "ECG",          # normalise EKG → ECG
+    "mri":   "MRI",
+    "ct scan": "CT scan",
+    "hba1c": "HbA1c",
+    "copd":  "COPD",
+    "prn":   "as needed",
+    "3-day": "3 days",
+    "covid": "COVID-19",
+    "ekg":   "ECG",
+    "mrsa":  "MRSA",
+    "dvt":   "DVT",
+    "pe":    "PE",
+    "uti":   "UTI",
+    "uri":   "URI",
+}
+
+# ── subsumption map ──────────────────────────────────────────────────────────
+# broad_term → set of more-specific phrases that make the broad term redundant.
+# Applies within the SAME entity category.
+SUBSUMPTION_MAP: dict[str, set[str]] = {
+    # symptoms
+    "pain":          {"chest pain", "abdominal pain", "back pain", "joint pain",
+                      "throat pain", "flank pain", "pelvic pain"},
+    "breath":        {"shortness of breath"},
+    "swelling":      {"edema", "peripheral edema"},
+    # conditions
+    "diabetes":      {"type 2 diabetes", "type 1 diabetes",
+                      "gestational diabetes", "diabetic"},
+    "kidney disease": {"chronic kidney disease"},
+    # procedures
+    "x-ray":         {"chest x-ray"},
+}
+
+
+# ── keyword dictionaries ─────────────────────────────────────────────────────
+# Longer / more specific phrases must appear BEFORE shorter ones in each list
+# because _keyword_ner() sorts by length descending before scanning.
 
 _SYMPTOM_KEYWORDS: list[str] = [
-    "chest pain", "shortness of breath", "dyspnea", "pain", "fever",
-    "cough", "fatigue", "nausea", "vomiting", "dizziness", "headache",
-    "chills", "sweating", "weakness", "swelling", "edema", "rash",
-    "diarrhea", "constipation", "palpitations", "syncope", "seizure",
-    "tremor", "confusion", "lethargy", "malaise",
+    "shortness of breath", "chest pain", "abdominal pain", "back pain",
+    "joint pain", "throat pain", "peripheral edema",
+    "dyspnea", "fever", "cough", "fatigue", "nausea", "vomiting",
+    "dizziness", "headache", "chills", "sweating", "weakness",
+    "edema", "rash", "diarrhea", "constipation", "palpitations",
+    "syncope", "seizure", "tremor", "confusion", "lethargy",
+    "malaise", "pain",
 ]
 
 _CONDITION_KEYWORDS: list[str] = [
-    "hypertension", "type 2 diabetes", "diabetes", "asthma", "pneumonia",
-    "influenza", "copd", "heart failure", "stroke", "cancer", "anemia",
-    "infection", "covid", "arthritis", "depression", "anxiety",
-    "atrial fibrillation", "myocardial infarction", "chronic kidney disease",
+    "type 2 diabetes", "type 1 diabetes", "chronic kidney disease",
+    "atrial fibrillation", "myocardial infarction", "heart failure",
+    "hypertension", "pneumonia", "influenza", "asthma",
+    "copd", "stroke", "cancer", "anemia", "infection",
+    "covid", "arthritis", "depression", "anxiety",
     "hypothyroidism", "hyperthyroidism", "sepsis",
+    "diabetes", "hyperlipidemia", "obesity",
 ]
 
 _MEDICATION_KEYWORDS: list[str] = [
-    "aspirin", "metformin", "lisinopril", "atorvastatin", "amoxicillin",
-    "ibuprofen", "acetaminophen", "omeprazole", "warfarin", "insulin",
-    "albuterol", "prednisone", "levothyroxine", "losartan", "amlodipine",
-    "metoprolol", "furosemide", "gabapentin", "clopidogrel", "simvastatin",
-    "hydrochlorothiazide", "sertraline", "fluoxetine", "pantoprazole",
+    "hydrochlorothiazide", "levothyroxine", "atorvastatin",
+    "amoxicillin", "acetaminophen", "simvastatin",
+    "pantoprazole", "clopidogrel", "metoprolol",
+    "furosemide", "gabapentin", "sertraline",
+    "fluoxetine", "amlodipine", "omeprazole",
+    "lisinopril", "metformin", "warfarin",
+    "losartan", "prednisone", "albuterol",
+    "ibuprofen", "insulin", "aspirin",
 ]
 
 _PROCEDURE_KEYWORDS: list[str] = [
-    "chest x-ray", "x-ray", "mri", "ct scan", "ecg", "ekg",
-    "blood test", "urinalysis", "biopsy", "ultrasound", "endoscopy",
-    "colonoscopy", "spirometry", "echocardiogram", "angiography",
-    "lumbar puncture", "troponin", "hba1c", "complete blood count",
+    "complete blood count", "chest x-ray", "lumbar puncture",
+    "echocardiogram", "angiography", "colonoscopy",
+    "endoscopy", "urinalysis", "blood test",
+    "ultrasound", "spirometry", "biopsy",
+    "troponin", "hba1c", "ct scan",
+    "ekg", "ecg", "mri",
+    "x-ray",
 ]
 
 _DURATION_KEYWORDS: list[str] = [
-    "3-day", "two days", "three days", "one week", "two weeks",
-    "for the past", "since", "days", "weeks", "months", "years",
-    "hours", "chronic", "acute", "onset", "daily", "twice daily",
-    "6 months", "prn",
+    "for the past three days", "for the past two days", "for the past week",
+    "for the past month", "for the past year",
+    "three days", "two days", "one week", "two weeks",
+    "3-day", "6 months", "twice daily",
+    "days", "weeks", "months", "years", "hours",
+    "chronic", "acute", "onset", "daily", "prn",
+    "for the past", "since",
 ]
 
 _SEVERITY_KEYWORDS: list[str] = [
-    "severe", "mild", "moderate", "critical", "acute", "chronic",
-    "worsening", "improving", "stable", "unstable", "elevated",
-    "consistently", "significantly", "progressively",
+    "progressively", "significantly", "consistently",
+    "worsening", "improving", "unstable",
+    "critical", "elevated", "moderate",
+    "severe", "stable", "chronic",
+    "acute", "mild",
 ]
 
 _KEYWORD_GROUPS: list[tuple[list[str], str]] = [
@@ -103,135 +153,104 @@ _KEYWORD_GROUPS: list[tuple[list[str], str]] = [
 ]
 
 
-# ── model loading ───────────────────────────────────────────────────────────
+# model loading
 
 def load_clinical_bert(model_name: str = "medicalai/ClinicalBERT") -> None:
     """
-    Load the ClinicalBERT tokenizer and encoder model.
-
-    Per the official model card, this model is loaded via AutoTokenizer
-    and AutoModel — NOT as a NER pipeline, because it is a masked language
-    model without a trained token-classification head.
-
+    Load the ClinicalBERT tokenizer and encoder (AutoTokenizer + AutoModel).
+    Per the official model card — NOT as a NER pipeline.
     Safe to call multiple times; only loads once.
     """
     global _tokenizer, _model, _model_loaded
-
     if _model_loaded:
         return
-
-    _model_loaded = True  # mark immediately to avoid duplicate load attempts
+    _model_loaded = True
 
     try:
         from transformers import AutoTokenizer, AutoModel
-
         logger.info("Loading ClinicalBERT tokenizer: %s", model_name)
         _tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-        logger.info("Loading ClinicalBERT encoder model: %s", model_name)
+        logger.info("Loading ClinicalBERT encoder: %s", model_name)
         _model = AutoModel.from_pretrained(model_name)
         _model.eval()
-
         logger.info(
-            "ClinicalBERT loaded successfully as a masked language model encoder. "
-            "Its clinical-domain tokenizer will be used to reconstruct text "
-            "before keyword-based entity extraction."
+            "ClinicalBERT loaded. Clinical-domain tokenizer active for "
+            "text reconstruction before entity extraction."
         )
-
     except Exception as exc:
         logger.warning(
             "Could not load ClinicalBERT (%s). "
-            "NER will run keyword matching on raw text. Error: %s",
-            model_name,
-            exc,
+            "Keyword NER will run on raw text. Error: %s",
+            model_name, exc,
         )
         _tokenizer = None
         _model = None
 
 
-# ── NER entry point ─────────────────────────────────────────────────────────
+# NER entry point 
 
 def run_ner(text: str) -> list[dict]:
     """
     Extract clinical entities from *text*.
 
-    Step 1 — Tokenize with ClinicalBERT's clinical-domain tokenizer to
-             reconstruct a clean surface form (handles medical abbreviations
-             and subword splits correctly).
+    1. Tokenize → decode with ClinicalBERT tokenizer (clinical vocabulary).
+    2. Keyword-based NER on the reconstructed surface text.
 
-    Step 2 — Apply keyword-based NER on the reconstructed text, producing
-             entity dicts compatible with the downstream entity_extractor.
-
-    Returns a list of entity dicts:
-        {
-            "word":         str,   # matched clinical term
-            "entity_group": str,   # e.g. "SYMPTOM", "DRUG"
-            "score":        float, # synthetic confidence (0.85)
-            "start":        int,
-            "end":          int,
-        }
+    Returns entity dicts with keys: word, entity_group, score, start, end.
     """
     if not text.strip():
         return []
-
-    # Use ClinicalBERT's tokenizer to reconstruct a clean surface text.
-    # This handles clinical abbreviations and compound medical terms correctly.
-    surface_text = _reconstruct_with_tokenizer(text)
-
-    return _keyword_ner(surface_text)
+    surface = _reconstruct_with_tokenizer(text)
+    return _keyword_ner(surface)
 
 
-# ── tokenizer-assisted text reconstruction ──────────────────────────────────
+# tokenizer reconstruction 
 
 def _reconstruct_with_tokenizer(text: str) -> str:
-    """
-    Tokenize *text* with the ClinicalBERT tokenizer and decode back to a
-    clean string.  Falls back to the original text if unavailable.
-    """
+    """Round-trip through the ClinicalBERT tokenizer to normalise the text."""
     if _tokenizer is None:
         return text
-
     try:
-        token_ids = _tokenizer.encode(
-            text,
-            add_special_tokens=False,
-            max_length=512,
-            truncation=True,
+        ids = _tokenizer.encode(
+            text, add_special_tokens=False, max_length=512, truncation=True,
         )
-        reconstructed: str = _tokenizer.decode(token_ids, skip_special_tokens=True)
-        return reconstructed if reconstructed.strip() else text
+        decoded = _tokenizer.decode(ids, skip_special_tokens=True)
+        return decoded if decoded.strip() else text
     except Exception as exc:
-        logger.debug("Tokenizer reconstruction failed (%s); using raw text.", exc)
+        logger.debug("Tokenizer round-trip failed (%s); using raw text.", exc)
         return text
 
 
-# ── keyword-based NER ────────────────────────────────────────────────────────
+# keyword NER
 
 def _keyword_ner(text: str) -> list[dict]:
     """
-    Scan *text* for clinical keywords and return entity dicts.
-
-    Longer / more specific phrases are matched before shorter ones so that
-    "chest pain" is preferred over a bare "pain" match.
+    Scan *text* for clinical keywords longest-first (greedy match).
+    Returns entity dicts compatible with entity_extractor.
     """
-    lower_text = text.lower()
+    lower = text.lower()
     found: list[dict] = []
-    seen: set[str] = set()
+    # Track matched character spans to avoid sub-matches inside longer matches
+    matched_spans: list[tuple[int, int]] = []
+    seen_words: set[str] = set()
 
     for keywords, label in _KEYWORD_GROUPS:
-        # Sort longest keyword first to prefer specific multi-word matches
         for kw in sorted(keywords, key=len, reverse=True):
-            if kw in lower_text and kw not in seen:
-                seen.add(kw)
-                start_idx = lower_text.index(kw)
-                found.append(
-                    {
+            idx = lower.find(kw)
+            while idx != -1:
+                end = idx + len(kw)
+                # Skip if this span is inside an already-matched longer span
+                overlaps = any(s <= idx and end <= e for s, e in matched_spans)
+                if not overlaps and kw not in seen_words:
+                    seen_words.add(kw)
+                    matched_spans.append((idx, end))
+                    found.append({
                         "word": kw,
                         "entity_group": label,
-                        "score": 0.85,       # synthetic confidence
-                        "start": start_idx,
-                        "end": start_idx + len(kw),
-                    }
-                )
+                        "score": 0.85,
+                        "start": idx,
+                        "end": end,
+                    })
+                idx = lower.find(kw, idx + 1)
 
     return found

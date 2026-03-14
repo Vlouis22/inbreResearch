@@ -3,11 +3,11 @@ Medical T5 summarization model wrapper.
 
 Model: Falconsai/medical_summarization
 
-NOTE: This model's HuggingFace config does not declare a pipeline_tag that
+This model's HuggingFace config does not declare a pipeline_tag that
 newer versions of `transformers` recognise as "summarization", so using
 `pipeline("summarization", model=...)` raises an "Unknown task" error.
 
-Fix: load the model directly via AutoModelForSeq2SeqLM + AutoTokenizer and
+loads the model directly via AutoModelForSeq2SeqLM + AutoTokenizer and
 call model.generate() explicitly.  This bypasses the pipeline task registry
 entirely and works with any version of transformers.
 """

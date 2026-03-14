@@ -1,7 +1,7 @@
 """
 Clinical Text Agent — main entry point.
 
-Demonstrates the full pipeline end-to-end:
+end-to-end steps:
 
   1.  Receive clinical inputs (text or audio paths)
   2.  Convert audio inputs to text via ASR
@@ -11,9 +11,6 @@ Demonstrates the full pipeline end-to-end:
   6.  Combine texts and generate Medical T5 summary            [Pipeline 2]
   7.  Merge into a Structured Patient Profile
   8.  Print the profile as formatted JSON
-
-The pipeline stops at the Structured Patient Profile.
-Diagnostic reasoning is NOT implemented here.
 """
 
 import json
@@ -22,9 +19,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
 # Ensure the project root is on sys.path when running as a script
-# ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import CLINICAL_BERT_MODEL, MEDICAL_T5_MODEL, WHISPER_MODEL
@@ -46,10 +41,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Input data class
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ClinicalInput:
     """Represents a single clinical input source."""
@@ -57,10 +48,7 @@ class ClinicalInput:
     content: str       # raw text OR path to an audio file
 
 
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
+# Load models at the module level so they're ready when the pipeline runs.
 def load_all_models() -> None:
     """Load all models required by the pipeline."""
     logger.info("=== Loading models ===")
@@ -70,10 +58,7 @@ def load_all_models() -> None:
     logger.info("=== All models ready ===")
 
 
-# ---------------------------------------------------------------------------
 # Pipeline stages
-# ---------------------------------------------------------------------------
-
 def stage_asr(inputs: list[ClinicalInput]) -> list[tuple[ClinicalInput, str]]:
     """
     Stage 2 & 3 — Inspect each input and convert audio to text where needed.
@@ -141,9 +126,6 @@ def stage_build_profile(
     )
 
 
-# ---------------------------------------------------------------------------
-# Top-level orchestrator
-# ---------------------------------------------------------------------------
 
 def run_pipeline(inputs: list[ClinicalInput]) -> StructuredPatientProfile:
     """
@@ -179,11 +161,9 @@ def run_pipeline(inputs: list[ClinicalInput]) -> StructuredPatientProfile:
     return profile
 
 
-# ---------------------------------------------------------------------------
 # Example inputs
-# ---------------------------------------------------------------------------
 
-EXAMPLE_INPUTS: list[ClinicalInput] = [
+EXAMPLE_INPUTS_2: list[ClinicalInput] = [
     # ClinicalInput(
     #     source_type="doctor_notes",
     #     content=(
@@ -211,30 +191,63 @@ EXAMPLE_INPUTS: list[ClinicalInput] = [
     ),
 ]
 
+EXAMPLE_INPUTS_3: list[ClinicalInput] = [
+    ClinicalInput(
+        source_type="doctor_notes",
+        content=(
+            "Patient reports severe chest pain for the past 2 days. Pain worsens with exertion. Mild shortness of breath observed during examination. Blood pressure elevated."
+        ),
+    ),
+    ClinicalInput(
+        source_type="patient_conversation",
+        content=(
+            "I started feeling a tight pain in my chest about two days ago. It gets worse when I walk upstairs. I also feel a little out of breath sometimes."
+        )
+    ),
+    ClinicalInput(
+        source_type="health_records",
+        content=(
+            "Patient has a history of hypertension and high cholesterol. Former smoker. Family history of coronary artery disease."
+        ),
+    ),
+]
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+EXAMPLE_INPUTS: list[ClinicalInput] = [
+    ClinicalInput(
+        source_type="doctor_notes",
+        content=(
+            "Patient presents with persistent cough and mild fever for 3 days. Lung auscultation reveals crackles in the right lower lobe. Oxygen saturation slightly reduced at 93%. Possible respiratory infection suspected."
+        ),
+    ),
+    ClinicalInput(
+        source_type="patient_conversation",
+        content=(
+            "I've been coughing a lot for about three days and I feel tired. I also had a fever last night and some difficulty breathing when walking."
+        )
+    ),
+    ClinicalInput(
+        source_type="health_records",
+        content=(
+            "Patient has a history of asthma. Uses albuterol inhaler as needed. No recent hospitalizations. Non-smoker."
+        ),
+    ),
+]
+
 
 def main() -> None:
-    print("=" * 70)
     print("  Clinical Text Agent — Structured Patient Profile Generator")
-    print("=" * 70)
+    print("\n")
 
-    # Load all models (with graceful fallback if unavailable)
     load_all_models()
 
     logger.info("Processing %d clinical input(s)...", len(EXAMPLE_INPUTS))
     profile: StructuredPatientProfile = run_pipeline(EXAMPLE_INPUTS)
 
-    # Output the Structured Patient Profile as formatted JSON
-    print("\n" + "=" * 70)
+    print("\n")
     print("  STRUCTURED PATIENT PROFILE")
-    print("=" * 70)
+    print("\n")
     print(profile.model_dump_json(indent=2))
-    print("=" * 70)
-    print("  Pipeline complete. Diagnostic reasoning is handled by a separate system.")
-    print("=" * 70)
+    print("\n")
 
 
 if __name__ == "__main__":
