@@ -1,5 +1,5 @@
 """
-Clinical Text Agent — main entry point.
+Clinical + Lab extraction entry point.
 
 end-to-end steps:
 
@@ -9,8 +9,9 @@ end-to-end steps:
   4.  Run ClinicalBERT entity extraction (per source)          [Pipeline 1]
   5.  Fuse entities from all sources
   6.  Combine texts and generate Medical T5 summary            [Pipeline 2]
-  7.  Merge into a Structured Patient Profile
-  8.  Print the profile as formatted JSON
+  7.  Optionally process laboratory inputs through the Lab Agent
+  8.  Merge into a Structured Patient Profile
+  9.  Print the profile as formatted JSON
 """
 
 import json
@@ -28,9 +29,11 @@ from models.clinical_bert_model import load_clinical_bert
 from models.medical_t5_model import load_medical_t5
 from pipeline.entity_extractor import extract_entities
 from pipeline.entity_fusion import fuse_entities
+from pipeline.lab_pipeline import LabInput, load_lab_models, run_lab_pipeline
 from pipeline.summarizer import generate_summary
 from pipeline.text_normalizer import normalize
 from schemas.clinical_entities import ClinicalEntities
+from schemas.lab_profile import LabProfile
 from schemas.structured_patient_profile import SourceMetadata, StructuredPatientProfile
 from utils.text_utils import is_audio_file
 
@@ -55,6 +58,7 @@ def load_all_models() -> None:
     load_asr_model(WHISPER_MODEL)
     load_clinical_bert(CLINICAL_BERT_MODEL)
     load_medical_t5(MEDICAL_T5_MODEL)
+    load_lab_models()
     logger.info("=== All models ready ===")
 
 
@@ -111,6 +115,7 @@ def stage_build_profile(
     unified_entities: ClinicalEntities,
     medical_summary: str,
     inputs: list[ClinicalInput],
+    lab_profile: LabProfile | None = None,
 ) -> StructuredPatientProfile:
     """Stage 9 & 10 — Merge pipeline outputs into the Structured Patient Profile."""
     source_types = {inp.source_type for inp in inputs}
@@ -122,17 +127,21 @@ def stage_build_profile(
     return StructuredPatientProfile(
         clinical_entities=unified_entities,
         medical_summary=medical_summary,
+        lab_profile=lab_profile or LabProfile(),
         source_metadata=metadata,
     )
 
 
-
-def run_pipeline(inputs: list[ClinicalInput]) -> StructuredPatientProfile:
+def run_pipeline(
+    inputs: list[ClinicalInput],
+    lab_inputs: list[LabInput] | None = None,
+) -> StructuredPatientProfile:
     """
-    Execute the full Clinical Text Agent pipeline on *inputs*.
+    Execute the structured extraction pipeline on clinical inputs and optional lab inputs.
 
     Args:
         inputs: List of ClinicalInput objects (text or audio).
+        lab_inputs: Optional list of LabInput objects.
 
     Returns:
         A :class:`StructuredPatientProfile` — the terminal output.
@@ -155,8 +164,11 @@ def run_pipeline(inputs: list[ClinicalInput]) -> StructuredPatientProfile:
     # Stages 7 & 8: Summarization (Pipeline 2)
     medical_summary = stage_summarization(normalized_pairs)
 
+    # Lab Agent
+    lab_profile = run_lab_pipeline(lab_inputs or [])
+
     # Stages 9 & 10: Assemble Structured Patient Profile
-    profile = stage_build_profile(unified_entities, medical_summary, inputs)
+    profile = stage_build_profile(unified_entities, medical_summary, inputs, lab_profile=lab_profile)
 
     return profile
 
@@ -233,15 +245,39 @@ EXAMPLE_INPUTS: list[ClinicalInput] = [
     ),
 ]
 
+EXAMPLE_LAB_INPUTS: list[LabInput] = [
+    LabInput(
+        source_type="digital_table",
+        content=(
+            "CBC\n"
+            "Test Result Unit Reference Range Flag\n"
+            "WBC 12.4 K/uL 4.0-10.5 H\n"
+            "Hemoglobin 10.2 g/dL 12.0-15.5 L\n"
+            "Platelets 265 K/uL 150-400 N\n\n"
+            "BMP\n"
+            "Sodium 132 mmol/L 135-145 L\n"
+            "Potassium 4.8 mmol/L 3.5-5.1 N\n"
+            "Creatinine 1.6 mg/dL 0.6-1.3 H\n"
+            "Glucose 182 mg/dL 70-99 H\n\n"
+            "Troponin\n"
+            "Troponin I 0.12 ng/mL <0.04 H\n"
+        ),
+    )
+]
+
 
 def main() -> None:
-    print("  Clinical Text Agent — Structured Patient Profile Generator")
+    print("  Dr. House — Structured Patient Profile Generator")
     print("\n")
 
     load_all_models()
 
-    logger.info("Processing %d clinical input(s)...", len(EXAMPLE_INPUTS))
-    profile: StructuredPatientProfile = run_pipeline(EXAMPLE_INPUTS)
+    logger.info(
+        "Processing %d clinical input(s) and %d lab input(s)...",
+        len(EXAMPLE_INPUTS),
+        len(EXAMPLE_LAB_INPUTS),
+    )
+    profile: StructuredPatientProfile = run_pipeline(EXAMPLE_INPUTS, lab_inputs=EXAMPLE_LAB_INPUTS)
 
     print("\n")
     print("  STRUCTURED PATIENT PROFILE")
