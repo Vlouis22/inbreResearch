@@ -1,6 +1,7 @@
 from .entity_extractor import extract_entities
 from .entity_fusion import fuse_entities
 from .lab_pipeline import LabInput, load_lab_models, run_lab_pipeline
+from .literature_pipeline import run_literature_pipeline
 from .summarizer import generate_summary
 from .text_normalizer import normalize, normalize_all
 
@@ -10,6 +11,7 @@ __all__ = [
     "LabInput",
     "load_lab_models",
     "run_lab_pipeline",
+    "run_literature_pipeline",
     "generate_summary",
     "normalize",
     "normalize_all",

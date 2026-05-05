@@ -109,6 +109,7 @@ pip install -r requirements.txt
 python main.py
 python lab_main.py
 python test_lab_pipeline.py
+python test_literature_pipeline.py
 ```
 
 Example output:
@@ -170,6 +171,40 @@ LabInput(source_type="pdf_report",    content="report.pdf")  # pypdf for text PD
 ```
 
 The Lab Agent uses report-provided reference ranges first and classifies abnormalities deterministically.
+
+---
+
+## Literature Retrieval Pipeline
+
+The project also includes a no-key biomedical literature pipeline for paper discovery and deterministic synthesis. It is intentionally separate from the patient-profile pipeline in v1.
+
+```python
+from pipeline.literature_pipeline import run_literature_pipeline
+from schemas.literature_profile import LiteratureSearchRequest
+
+profile = run_literature_pipeline(
+    LiteratureSearchRequest(
+        query="liver cancer immunotherapy",
+        theme_terms=["immunotherapy", "liver cancer"],
+        max_results=100,
+        sources=["europe_pmc", "pubmed"],
+        open_access_only=True,
+        fetch_full_text=True,
+    )
+)
+
+print(profile.model_dump_json(indent=2))
+```
+
+Key properties:
+
+- Uses official public APIs rather than Google Scholar scraping.
+- Defaults to Europe PMC; PubMed can be added through `sources=["europe_pmc", "pubmed"]`.
+- Uses local SQLite caching under `.cache/literature.sqlite3`; no database server is required.
+- Synthesizes with deterministic extractive evidence snippets; no OpenAI key, paid API, vector DB, or local LLM is required.
+- Downloads full text only when the source exposes legal free full-text XML.
+
+Google Scholar is treated as a manual link-out only because automated scraping is not a stable or compliant ingestion path.
 
 ---
 
